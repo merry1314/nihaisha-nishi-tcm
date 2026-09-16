@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import copy
 import hashlib
 import json
@@ -889,9 +888,7 @@ def split_sentences(text: str) -> list[str]:
     return [sentence for sentence in sentences if sentence]
 
 
-def split_long_text_to_paragraphs(
-    text: str, max_chars: int = 900, min_chars: int = 120
-) -> list[str]:
+def split_long_text_to_paragraphs(text: str, max_chars: int = 900) -> list[str]:
     sentences = split_sentences(text)
     if not sentences:
         return []
@@ -907,8 +904,6 @@ def split_long_text_to_paragraphs(
         else:
             current.append(sentence)
             current_len += sentence_len
-        if current_len >= min_chars and sentence.endswith(("。", "！", "？", "!", "?")):
-            continue
     if current:
         paragraphs.append("".join(current))
     return paragraphs
@@ -1759,6 +1754,12 @@ def normalize_dense_vector(vector: list[float]) -> list[float]:
 
 
 def dense_dot(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right):
+        raise ValueError(
+            f"dense vector dimension mismatch: query has {len(left)} dims, "
+            f"stored vector has {len(right)} dims. The store was probably built with a "
+            "different embedding model; rebuild the store and the FAISS index."
+        )
     return sum(a * b for a, b in zip(left, right))
 
 
@@ -2029,33 +2030,42 @@ def build_faiss_vector_index(
         dims = len(unpack_dense_vector(first["vector_blob"]))
         index = faiss.IndexFlatIP(dims)
 
-        total = 0
-        with ids_path.open("w", encoding="utf-8") as ids_file:
-            offset = 0
-            while True:
-                rows = conn.execute(
-                    """
-                    SELECT unit_id, weight, vector_blob
-                    FROM retrieval_units
-                    ORDER BY unit_id
-                    LIMIT ? OFFSET ?
-                    """,
-                    (batch_size, offset),
-                ).fetchall()
-                if not rows:
-                    break
-                vectors: list[list[float]] = []
-                for row in rows:
-                    vector = unpack_dense_vector(row["vector_blob"])
-                    vectors.append(vector)
-                    ids_file.write(
-                        json.dumps({"unit_id": row["unit_id"]}, ensure_ascii=False) + "\n"
-                    )
-                index.add(faiss_matrix(vectors))
-                total += len(rows)
-                offset += len(rows)
+        # The ids file is written to a temp path for the whole build so a
+        # failure mid-build leaves the previous index/ids pair usable instead
+        # of a truncated ids file paired with a stale index.
+        ids_tmp_path = ids_path.with_name(f"{ids_path.name}.{os.getpid()}.tmp")
+        try:
+            total = 0
+            with ids_tmp_path.open("w", encoding="utf-8") as ids_file:
+                offset = 0
+                while True:
+                    rows = conn.execute(
+                        """
+                        SELECT unit_id, weight, vector_blob
+                        FROM retrieval_units
+                        ORDER BY unit_id
+                        LIMIT ? OFFSET ?
+                        """,
+                        (batch_size, offset),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    vectors: list[list[float]] = []
+                    for row in rows:
+                        vector = unpack_dense_vector(row["vector_blob"])
+                        vectors.append(vector)
+                        ids_file.write(
+                            json.dumps({"unit_id": row["unit_id"]}, ensure_ascii=False) + "\n"
+                        )
+                    index.add(faiss_matrix(vectors))
+                    total += len(rows)
+                    offset += len(rows)
 
-        faiss.write_index(index, str(index_path))
+            faiss.write_index(index, str(index_path))
+            ids_tmp_path.replace(ids_path)
+        finally:
+            ids_tmp_path.unlink(missing_ok=True)
+
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
             ("faiss_index", str(index_path)),
@@ -2072,7 +2082,12 @@ def build_faiss_vector_index(
 
     manifest_path = db_path.parent / "manifest.json"
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"manifest.json is not valid JSON: {manifest_path}; fix or remove it, then rebuild"
+            ) from error
         manifest["faiss_index"] = str(index_path)
         manifest["faiss_ids"] = str(ids_path)
         manifest["faiss_vectors"] = total
@@ -2970,59 +2985,75 @@ class LocalVectorStore:
             ).fetchone()
             return row is not None
 
-    def insert_units(self, units: Iterable[RetrievalUnit], insert_batch_size: int = 256) -> None:
+    def insert_units(
+        self,
+        units: Iterable[RetrievalUnit],
+        insert_batch_size: int = 256,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
         unit_list = list(units)
-        with self.connect() as conn:
-            for start in range(0, len(unit_list), insert_batch_size):
-                batch = unit_list[start : start + insert_batch_size]
-                vectors = self.embedding_backend.embed_texts(
-                    [unit.text_for_embedding for unit in batch]
+        if conn is not None:
+            self._insert_units_into(unit_list, conn, insert_batch_size)
+            return
+        with self.connect() as connection:
+            self._insert_units_into(unit_list, connection, insert_batch_size)
+
+    def _insert_units_into(
+        self,
+        unit_list: list[RetrievalUnit],
+        conn: sqlite3.Connection,
+        insert_batch_size: int,
+    ) -> None:
+        for start in range(0, len(unit_list), insert_batch_size):
+            batch = unit_list[start : start + insert_batch_size]
+            vectors = self.embedding_backend.embed_texts(
+                [unit.text_for_embedding for unit in batch]
+            )
+            if len(vectors) != len(batch):
+                raise RuntimeError("embedding backend returned a different number of vectors")
+            if self.embedding_backend.vector_kind == "dense":
+                vector_dim = len(vectors[0]) if vectors else 0
+                if any(len(vector) != vector_dim for vector in vectors):
+                    raise RuntimeError(
+                        "dense embedding backend returned inconsistent vector dimensions"
+                    )
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                    ("dims", str(vector_dim)),
                 )
-                if len(vectors) != len(batch):
-                    raise RuntimeError("embedding backend returned a different number of vectors")
-                if self.embedding_backend.vector_kind == "dense":
-                    vector_dim = len(vectors[0]) if vectors else 0
-                    if any(len(vector) != vector_dim for vector in vectors):
-                        raise RuntimeError(
-                            "dense embedding backend returned inconsistent vector dimensions"
-                        )
-                    conn.execute(
-                        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                        ("dims", str(vector_dim)),
-                    )
-                    conn.execute(
-                        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                        ("vector_dim", str(vector_dim)),
-                    )
-                rows = []
-                for unit, vector in zip(batch, vectors):
-                    vector_blob = (
-                        pack_sparse_vector(vector)
-                        if self.embedding_backend.vector_kind == "sparse"
-                        else pack_dense_vector(vector)
-                    )
-                    rows.append(
-                        (
-                            unit.unit_id,
-                            unit.paragraph_id,
-                            unit.doc_id,
-                            unit.unit_type,
-                            unit.text,
-                            unit.sentence_start,
-                            unit.sentence_end,
-                            unit.weight,
-                            vector_blob,
-                        )
-                    )
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO retrieval_units
-                    (unit_id, paragraph_id, doc_id, unit_type, text,
-                     sentence_start, sentence_end, weight, vector_blob)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                    ("vector_dim", str(vector_dim)),
                 )
+            rows = []
+            for unit, vector in zip(batch, vectors):
+                vector_blob = (
+                    pack_sparse_vector(vector)
+                    if self.embedding_backend.vector_kind == "sparse"
+                    else pack_dense_vector(vector)
+                )
+                rows.append(
+                    (
+                        unit.unit_id,
+                        unit.paragraph_id,
+                        unit.doc_id,
+                        unit.unit_type,
+                        unit.text,
+                        unit.sentence_start,
+                        unit.sentence_end,
+                        unit.weight,
+                        vector_blob,
+                    )
+                )
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO retrieval_units
+                (unit_id, paragraph_id, doc_id, unit_type, text,
+                 sentence_start, sentence_end, weight, vector_blob)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
 
     def stats(self) -> dict[str, int | str]:
         with self.connect() as conn:
@@ -7175,7 +7206,9 @@ def build_pdf_vector_store(
 ) -> dict[str, int | str]:
     pdf_dir = pdf_dir.expanduser().resolve()
     out_dir = out_dir.expanduser().resolve()
-    pdf_paths = sorted(list(pdf_dir.glob("*.pdf")) + list(pdf_dir.glob("*.PDF")))
+    # Dedupe: on case-insensitive filesystems (Windows, default macOS) both
+    # globs return the same files and each PDF would be ingested twice.
+    pdf_paths = sorted({*pdf_dir.glob("*.pdf"), *pdf_dir.glob("*.PDF")})
     if not pdf_paths:
         raise FileNotFoundError(f"No PDF files found in {pdf_dir}")
     source_catalog = load_build_source_catalog(source_catalog_path)
@@ -7329,9 +7362,12 @@ def augment_pdf_vector_store_questions(
     ]
     question_units = build_question_retrieval_units(paragraphs)
 
+    # Embedding happens inside insert_units; keeping the delete in the same
+    # transaction means an embedding failure rolls back instead of dropping
+    # the existing question units and invalidating the FAISS bundle.
     with store.connect() as conn:
         conn.execute("DELETE FROM retrieval_units WHERE unit_type = 'question'")
-    store.insert_units(question_units)
+        store.insert_units(question_units, conn=conn)
     _update_manifest_after_question_augment(db_path)
 
     stats = store.stats()
@@ -7362,7 +7398,12 @@ def _update_manifest_after_question_augment(db_path: Path) -> None:
             """
         ).fetchall()
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"manifest.json is not valid JSON: {manifest_path}; fix or remove it, then rebuild"
+        ) from error
     manifest["paragraphs"] = total_paragraphs
     manifest["retrieval_units"] = total_units
     manifest["unit_types"] = unit_types
@@ -7462,121 +7503,6 @@ def create_embedding_backend_for_db(
     return SparseHashEmbeddingBackend(dims=int(meta.get("dims", dims)))
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Build and search a local PDF vector store.")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    build = sub.add_parser("build", help="build a local SQLite vector store from PDFs")
-    build.add_argument("--pdf-dir", type=Path, required=True)
-    build.add_argument("--out", type=Path, required=True)
-    build.add_argument("--window-size", type=int, default=6)
-    build.add_argument("--overlap", type=int, default=2)
-    build.add_argument("--dims", type=int, default=2048)
-    build.add_argument(
-        "--embedding",
-        choices=["sparse", "siliconflow", "local-bge-m3"],
-        default="siliconflow",
-    )
-    build.add_argument("--model", default="BAAI/bge-m3")
-    build.add_argument("--batch-size", type=int, default=32)
-    build.add_argument(
-        "--unit-types",
-        default="sentence,window,paragraph,question",
-        help="Comma-separated retrieval unit types to embed.",
-    )
-    build.add_argument("--trace-dir", type=Path, default=None)
-
-    search = sub.add_parser("search", help="search a built PDF vector store")
-    search.add_argument("query")
-    search.add_argument("--db", type=Path, required=True)
-    search.add_argument("--limit", type=int, default=5)
-    search.add_argument(
-        "--mode", choices=["hybrid", "vector", "text", "knowledge"], default="hybrid"
-    )
-    search.add_argument(
-        "--embedding",
-        choices=["auto", "sparse", "siliconflow", "local-bge-m3"],
-        default="auto",
-    )
-    search.add_argument("--model", default="BAAI/bge-m3")
-    search.add_argument("--batch-size", type=int, default=32)
-
-    augment_questions = sub.add_parser(
-        "augment-questions",
-        help="add question retrieval units to an existing vector store",
-    )
-    augment_questions.add_argument("--db", type=Path, required=True)
-    augment_questions.add_argument(
-        "--embedding",
-        choices=["auto", "sparse", "siliconflow", "local-bge-m3"],
-        default="auto",
-    )
-    augment_questions.add_argument("--model", default="BAAI/bge-m3")
-    augment_questions.add_argument("--batch-size", type=int, default=32)
-
-    text_index = sub.add_parser("rebuild-text-index", help="rebuild the FTS original-text index")
-    text_index.add_argument("--db", type=Path, required=True)
-
-    knowledge = sub.add_parser("rebuild-knowledge-units", help="extract grounded knowledge units")
-    knowledge.add_argument("--db", type=Path, required=True)
-    knowledge.add_argument("--trace-dir", type=Path, default=None)
-
-    args = parser.parse_args(argv)
-    if args.command == "build":
-        stats = build_pdf_vector_store(
-            pdf_dir=args.pdf_dir,
-            out_dir=args.out,
-            window_size=args.window_size,
-            overlap=args.overlap,
-            dims=args.dims,
-            embedding=args.embedding,
-            model=args.model,
-            batch_size=args.batch_size,
-            unit_types=parse_unit_types(args.unit_types),
-            trace_dir=args.trace_dir,
-        )
-        print(json.dumps(stats, ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "search":
-        if args.mode == "text":
-            store = LocalVectorStore(args.db)
-        else:
-            backend = create_embedding_backend_for_db(
-                args.db,
-                embedding=args.embedding,
-                model=args.model,
-                batch_size=args.batch_size,
-            )
-            store = LocalVectorStore(args.db, embedding_backend=backend)
-        results = store.search(args.query, limit=args.limit, mode=args.mode)
-        print(json.dumps(results, ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "augment-questions":
-        stats = augment_pdf_vector_store_questions(
-            args.db,
-            embedding=args.embedding,
-            model=args.model,
-            batch_size=args.batch_size,
-        )
-        print(json.dumps(stats, ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "rebuild-text-index":
-        store = LocalVectorStore(args.db)
-        print(json.dumps(store.rebuild_text_index(), ensure_ascii=False, indent=2))
-        return 0
-    if args.command == "rebuild-knowledge-units":
-        store = LocalVectorStore(args.db)
-        trace_dir = args.trace_dir or (args.db.parent / "traces")
-        print(
-            json.dumps(
-                store.rebuild_knowledge_units(trace_dir=trace_dir), ensure_ascii=False, indent=2
-            )
-        )
-        return 0
-    parser.error(f"unknown command: {args.command}")
-    return 2
-
-
 def parse_unit_types(value: str) -> set[str]:
     allowed = {"sentence", "window", "paragraph", "question"}
     unit_types = {item.strip() for item in value.split(",") if item.strip()}
@@ -7585,6 +7511,3 @@ def parse_unit_types(value: str) -> set[str]:
         raise ValueError(f"unsupported unit types: {', '.join(sorted(unknown))}")
     return unit_types or allowed
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())

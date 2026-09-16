@@ -317,50 +317,58 @@ class SiliconFlowReranker:
             "Content-Type": "application/json",
         }
         session = self.session
+        owned_session = False
         if session is None:
             import requests
 
             session = requests.Session()
+            owned_session = True
 
-        last_error: Exception | None = None
-        for attempt in range(self.max_retries):
-            try:
-                response = session.post(
-                    f"{self.base_url}/rerank",
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
+        try:
+            last_error: Exception | None = None
+            for attempt in range(self.max_retries):
                 try:
-                    response_payload = response.json()
-                except Exception:
-                    raise _RerankResponseError("rerank response body must be valid JSON") from None
-                ranked = self._validated_results(
-                    response_payload,
-                    candidates=candidates,
-                    original_indices=original_indices,
-                    limit=top_n,
-                )
-                return RerankOutcome(results=ranked, model=self.model)
-            except Exception as exc:
-                last_error = exc
-                if attempt + 1 < self.max_retries and self._is_retryable_error(exc):
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                break
+                    response = session.post(
+                        f"{self.base_url}/rerank",
+                        headers=headers,
+                        json=payload,
+                        timeout=self.timeout,
+                    )
+                    response.raise_for_status()
+                    try:
+                        response_payload = response.json()
+                    except Exception:
+                        raise _RerankResponseError(
+                            "rerank response body must be valid JSON"
+                        ) from None
+                    ranked = self._validated_results(
+                        response_payload,
+                        candidates=candidates,
+                        original_indices=original_indices,
+                        limit=top_n,
+                    )
+                    return RerankOutcome(results=ranked, model=self.model)
+                except Exception as exc:
+                    last_error = exc
+                    if attempt + 1 < self.max_retries and self._is_retryable_error(exc):
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    break
 
-        assert last_error is not None
-        if self.strict:
-            raise RuntimeError(
-                f"SiliconFlow rerank request failed: {self._safe_error(last_error)}"
-            ) from None
-        return RerankOutcome(
-            results=[dict(candidate) for candidate in candidates[:limit]],
-            model=self.model,
-            degraded_feature="siliconflow_rerank",
-            error=self._safe_error(last_error),
-        )
+            assert last_error is not None
+            if self.strict:
+                raise RuntimeError(
+                    f"SiliconFlow rerank request failed: {self._safe_error(last_error)}"
+                ) from None
+            return RerankOutcome(
+                results=[dict(candidate) for candidate in candidates[:limit]],
+                model=self.model,
+                degraded_feature="siliconflow_rerank",
+                error=self._safe_error(last_error),
+            )
+        finally:
+            if owned_session:
+                session.close()
 
     @staticmethod
     def _validated_results(
@@ -398,6 +406,9 @@ class SiliconFlowReranker:
                 raise _RerankResponseError("rerank relevance_score must be finite")
             validated.append((index, score_value))
 
+        # A partial result set is treated as a failure on purpose: silently
+        # accepting fewer ranked items would change ordering semantics, so the
+        # caller falls back to the original order instead (see rerank tests).
         if len(validated) != limit:
             raise _RerankResponseError(
                 f"rerank response returned {len(validated)} results; expected {limit}"

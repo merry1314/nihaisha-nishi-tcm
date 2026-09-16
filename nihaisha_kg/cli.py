@@ -293,9 +293,14 @@ def main(argv: list[str] | None = None) -> int:
             return _print_cli_error(args.command, exc)
 
     if args.command == "stats":
-        store = LocalVectorStore(args.db)
-        payload = store.stats()
-        payload.update(store.read_meta())
+        if not args.db.exists():
+            return _print_cli_error("stats", FileNotFoundError(f"database not found: {args.db}"))
+        try:
+            store = LocalVectorStore(args.db)
+            payload = store.stats()
+            payload.update(store.read_meta())
+        except (OSError, RuntimeError, sqlite3.DatabaseError) as exc:
+            return _print_cli_error("stats", exc)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
@@ -330,19 +335,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "build":
-        payload = build_pdf_vector_store(
-            pdf_dir=args.pdf_dir,
-            out_dir=args.out,
-            window_size=args.window_size,
-            overlap=args.overlap,
-            dims=args.dims,
-            embedding=args.embedding,
-            model=args.model,
-            batch_size=args.batch_size,
-            trace_dir=args.trace_dir,
-            source_catalog_path=args.source_catalog,
-            portable_source_paths=args.portable_source_paths,
-        )
+        if not 1 <= args.dims <= 65536:
+            # Sparse vectors pack bucket ids as uint16.
+            parser.error("--dims must be between 1 and 65536")
+        try:
+            payload = build_pdf_vector_store(
+                pdf_dir=args.pdf_dir,
+                out_dir=args.out,
+                window_size=args.window_size,
+                overlap=args.overlap,
+                dims=args.dims,
+                embedding=args.embedding,
+                model=args.model,
+                batch_size=args.batch_size,
+                trace_dir=args.trace_dir,
+                source_catalog_path=args.source_catalog,
+                portable_source_paths=args.portable_source_paths,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
+            return _print_cli_error("build", exc)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 

@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import json
+import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from typing import Any
 
 
@@ -100,9 +102,16 @@ def load_json(path: Path) -> Any:
 
 def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    temporary.replace(path)
+    # A uniquely named temp file per process: two concurrent builds must not
+    # overwrite each other's in-progress write to the same fixed .tmp path.
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+    ) as temporary:
+        temporary.write(content)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary_path = Path(temporary.name)
+    temporary_path.replace(path)
 
 
 def load_existing_cards(cards_path: Path) -> dict[str, dict[str, Any]]:
@@ -344,7 +353,6 @@ def main() -> int:
         normalize_cjk_spacing = source_document.get("normalize_cjk_spacing", False)
         metadata = source_metadata(source_document)
         card_metadata = {key: value for key, value in metadata.items() if key != "page_terms"}
-        source_role = metadata.get("source_role")
         text_extraction = source_document.get("text_extraction", "native")
         ocr_model = source_document.get("ocr_model")
         ocr_records = (

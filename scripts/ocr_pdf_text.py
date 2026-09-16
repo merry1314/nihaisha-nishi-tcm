@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import time
 from typing import Any
 
@@ -64,7 +65,17 @@ def load_completed_pages(path: Path, doc_id: str) -> set[int]:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # A crash between write and fsync can leave a partial line;
+                # treat everything from there on as unfinished work instead
+                # of making the file permanently unresumable.
+                print(
+                    f"warning: ignoring corrupt resume log tail at {path}:{line_number}",
+                    file=sys.stderr,
+                )
+                break
             if record.get("doc_id") != doc_id:
                 raise ValueError(f"Unexpected doc_id at {path}:{line_number}")
             completed.add(int(record["page"]))

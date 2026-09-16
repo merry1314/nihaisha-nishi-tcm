@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -27,11 +28,28 @@ def stop(process: subprocess.Popen[Any]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=5)
+        return
     except (ProcessLookupError, subprocess.TimeoutExpired):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def feed_stdin(process: subprocess.Popen[Any], prompt: str) -> None:
+    try:
+        assert process.stdin is not None
+        process.stdin.write(prompt)
+        process.stdin.close()
+    except (BrokenPipeError, OSError):
+        # The child exited before reading everything; the caller handles it
+        # as a failed batch through the usual valid()/retry path.
+        pass
 
 
 def valid(path: Path, expected_ids: list[str]) -> bool:
@@ -238,8 +256,12 @@ def main() -> int:
                     start_new_session=True,
                 )
                 assert process.stdin is not None
-                process.stdin.write(prompt)
-                process.stdin.close()
+                # Feed stdin from a thread: a child that never reads would
+                # otherwise block write() forever and defeat --timeout.
+                stdin_writer = threading.Thread(
+                    target=feed_stdin, args=(process, prompt), daemon=True
+                )
+                stdin_writer.start()
                 deadline = time.monotonic() + args.timeout
                 try:
                     while time.monotonic() < deadline and process.poll() is None:
@@ -248,6 +270,7 @@ def main() -> int:
                         time.sleep(1)
                 finally:
                     stop(process)
+                stdin_writer.join(timeout=1)
             if valid(output, expected_ids):
                 print(f"[{args.mode}] batch={number} attempt={attempt} ok", flush=True)
                 break
@@ -264,6 +287,28 @@ def main() -> int:
             answer["mode"] = args.mode
             merged.append(answer)
     target = args.merged_output or ROOT / f".local-evals/v1/{args.mode}_answers.jsonl"
+    if (args.case_id or args.case_id_pattern) and target.exists():
+        # A subset rerun must update the full merged file in place instead of
+        # replacing it with a file that only contains the rerun cases.
+        rerun_by_id = {str(answer["case_id"]): answer for answer in merged}
+        merged_with_history = read_jsonl(target)
+        replaced_ids: set[str] = set()
+        for index, row in enumerate(merged_with_history):
+            row_id = str(row["case_id"])
+            if row_id in rerun_by_id:
+                merged_with_history[index] = rerun_by_id[row_id]
+                replaced_ids.add(row_id)
+        new_rows = [
+            answer
+            for answer in merged
+            if str(answer["case_id"]) not in replaced_ids
+        ]
+        merged = merged_with_history + new_rows
+        print(
+            f"[{args.mode}] merged subset rerun into existing file: "
+            f"replaced={len(replaced_ids)} added={len(new_rows)} total={len(merged)}",
+            flush=True,
+        )
     write_jsonl(target, merged)
     print(f"[{args.mode}] merged={len(merged)} output={target}")
     return 0

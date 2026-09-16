@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import Counter
-from pathlib import Path
 from typing import Any
 
 from v1_common import EVAL_DIR, read_jsonl, write_jsonl

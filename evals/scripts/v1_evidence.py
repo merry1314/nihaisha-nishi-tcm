@@ -130,10 +130,20 @@ PROVIDER_SAFE_LONG_LINE_TOKENS = {
 }
 
 
+# Single pass with longest-match-first alternation so replacements are never
+# re-replaced by later rules (e.g. 乳房→胸部 must not then hit 胸部→相关部位).
+_PROVIDER_SAFE_PATTERN = re.compile(
+    "|".join(
+        re.escape(source)
+        for source in sorted(PROVIDER_SAFE_REPLACEMENTS, key=len, reverse=True)
+    )
+)
+
+
 def replace_provider_sensitive_text(text: str) -> str:
-    for source, replacement in PROVIDER_SAFE_REPLACEMENTS.items():
-        text = text.replace(source, replacement)
-    return text
+    return _PROVIDER_SAFE_PATTERN.sub(
+        lambda match: PROVIDER_SAFE_REPLACEMENTS[match.group(0)], text
+    )
 
 
 def normalize_provider_sensitive_text(text: str, *, redact_all_lines: bool = False) -> str:
@@ -178,7 +188,7 @@ def grams(text: str) -> set[str]:
     result.update(
         token.lower()
         for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,8}", text)
-        if token not in STOP_CHARS
+        if any(character not in STOP_CHARS for character in token)
     )
     return result
 

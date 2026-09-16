@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import signal
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -146,17 +148,30 @@ def main() -> int:
                     f"{args.output.stem}.batch-{number:02d}.attempt-{attempt}.log"
                 )
                 with log.open("w", encoding="utf-8") as handle:
+                    process = subprocess.Popen(
+                        [*command_base, "-o", str(raw_output), "-"],
+                        stdin=subprocess.PIPE,
+                        stdout=handle,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        start_new_session=True,
+                    )
                     try:
-                        completed = subprocess.run(
-                            [*command_base, "-o", str(raw_output), "-"],
-                            input=prompt,
-                            text=True,
-                            stdout=handle,
-                            stderr=subprocess.STDOUT,
-                            timeout=args.timeout,
-                            check=False,
+                        process.communicate(input=prompt, timeout=args.timeout)
+                        completed = subprocess.CompletedProcess(
+                            command_base, process.returncode
                         )
                     except subprocess.TimeoutExpired:
+                        # The child runs in its own session, so the timeout
+                        # must kill the whole group or spawned workers survive.
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            pass
                         completed = subprocess.CompletedProcess(command_base, 124)
                 if completed.returncode == 0 and valid_batch():
                     break

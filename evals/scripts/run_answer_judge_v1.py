@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -160,11 +161,28 @@ def stop(process: subprocess.Popen[Any]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=5)
+        return
     except (ProcessLookupError, subprocess.TimeoutExpired):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def feed_stdin(process: subprocess.Popen[Any], prompt: str) -> None:
+    try:
+        assert process.stdin is not None
+        process.stdin.write(prompt)
+        process.stdin.close()
+    except (BrokenPipeError, OSError):
+        # The child exited before reading everything; the caller handles it
+        # as a failed batch through the usual valid_batch()/retry path.
+        pass
 
 
 def valid_batch(
@@ -419,8 +437,12 @@ def main() -> int:
                     start_new_session=True,
                 )
                 assert process.stdin is not None
-                process.stdin.write(prompt)
-                process.stdin.close()
+                # Feed stdin from a thread: a child that never reads would
+                # otherwise block write() forever and defeat --timeout.
+                stdin_writer = threading.Thread(
+                    target=feed_stdin, args=(process, prompt), daemon=True
+                )
+                stdin_writer.start()
                 deadline = time.monotonic() + args.timeout
                 try:
                     while time.monotonic() < deadline and process.poll() is None:
@@ -434,6 +456,7 @@ def main() -> int:
                         time.sleep(1)
                 finally:
                     stop(process)
+                stdin_writer.join(timeout=1)
             if valid_batch(output, batch, relevance_lengths, sample_id=args.sample_id):
                 print(f"[judge] batch={number} attempt={attempt} ok", flush=True)
                 break
